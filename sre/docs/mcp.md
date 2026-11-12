@@ -124,6 +124,8 @@ Use `--subresource=proxy`.
 
 ## Pointing it at a real cluster
 
+Short version below; the full list of questions (auth, private networks, approvals, ...) is in [production.md](production.md).
+
 1. Create a dedicated read-only ServiceAccount (copy `lab/rbac.yaml`; consider namespace-scoped `RoleBinding`s
    instead of cluster-wide).
 2. Generate a kubeconfig with a short-lived token for it; keep `read_only = true` and `denied_resources`.

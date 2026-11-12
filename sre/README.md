@@ -150,4 +150,5 @@ sre/
 4. [Kubernetes MCP server](docs/mcp.md): setup, tools exposed, how the agent is kept from changing the cluster
 5. [Testing](docs/testing.md): the three test levels, how the scripted model works, E2E grading
 6. [Troubleshooting](docs/troubleshooting.md): problems hit while building this, and fixes
-6. [Lab scenarios](lab/README.md): the seven failures and their expected fixes
+7. [Production](docs/production.md): questions to answer before a real cluster (auth, private networks, approvals, ...)
+8. [Lab scenarios](lab/README.md): the seven failures and their expected fixes
