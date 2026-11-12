@@ -101,37 +101,39 @@ Ranked options:
 
 ### 2.1 Remote MCP server (option 2)
 
-`kubernetes-mcp-server` has a Streamable HTTP mode: set `port` in its config and it serves MCP over HTTP instead
-of stdio.
+**Tried in the lab: [remote-mcp.md](remote-mcp.md)** (`mise run lab:remote-up`). `kubernetes-mcp-server` has a
+Streamable HTTP mode: set `port` and it serves MCP over HTTP instead of stdio.
 
 ```text
-agent (anywhere) ──HTTPS + OAuth bearer──▶ API gateway / LB ──▶ Service ──▶ kubernetes-mcp-server pod
-                                                                              │ in-cluster SA (read-only RBAC)
-                                                                              ▼
-                                                                         kube-apiserver (private)
+agent ──token from IdP (client credentials)──▶ IdP
+agent (anywhere) ──HTTPS + Bearer──▶ API gateway / LB ──▶ kubernetes-mcp-server pod (own SA: no RBAC)
+                                                            │ same token (passthrough) or exchanged token
+                                                            ▼
+                                                       kube-apiserver (private), trusts the IdP ──▶ RBAC
 ```
 
+Finding from the lab: with `require_oauth = true` the server **refuses to call Kubernetes as its own identity**
+(`cluster_auth_mode "kubeconfig" is not compatible with require_oauth=true`). The caller's identity must reach the
+API server, either by passing the token through or by exchanging it (RFC 8693). So the API server **must trust
+your IdP** (`AuthenticationConfiguration` / `--oidc-*`, or the cloud's equivalent), and RBAC is granted to the IdP
+identity. For an agent, that identity is a machine client (client credentials), not a person.
+
 ```toml
-# mcp.toml in the pod
+# config.toml in the pod (full lab version: lab/remote-mcp.yaml)
 port = "8080"
 cluster_provider_strategy = "in-cluster"
+cluster_auth_mode = "passthrough"                     # or a [token_exchange] block
 read_only = true
 toolsets = ["core"]
 denied_resources = [{group = "", version = "v1", kind = "Secret"}]
-require_oauth = true                                  # reject calls without a valid bearer token
+require_oauth = true
 authorization_url = "https://idp.example.com/realms/sre"
-server_url = "https://k8s-mcp.example.com"            # public URL, used for OAuth metadata
-# tls_cert / tls_key if TLS terminates at the pod instead of the gateway
+oauth_audience = "kubernetes-mcp-server"              # reject tokens minted for other apps
+server_url = "https://k8s-mcp.example.com"
 ```
 
-Agent side, `k8s.mcp_client()` changes from stdio to HTTP:
-
-```python
-from fastmcp import Client
-from fastmcp.client.auth import BearerAuth
-
-Client("https://k8s-mcp.example.com/mcp", auth=BearerAuth(token_from_idp()))   # or auth="oauth" for the browser flow
-```
+Agent side: `k8s.mcp_client()` switches to HTTP when `SRE_MCP_URL` is set, and gets its token with
+`k8s.ClientCredentials` (OAuth client credentials, refreshed before expiry).
 
 What the gateway should do: TLS, verify the token (or leave that to `require_oauth`), allow only listed source IPs
 or mTLS clients, rate limit per client, and allow long-lived streaming responses (raise idle timeouts).
@@ -188,8 +190,8 @@ cluster is broken, the agent may be broken too.
 
 | Model | How | Pro | Con |
 |---|---|---|---|
-| **Agent's own identity** (recommended for start) | SA / workload identity with fixed read-only RBAC | Simple, predictable, same rights for everyone | Audit logs show `sre-agent`; you need the agent's own log to know which human asked |
-| **On behalf of the user** | Remote MCP server with `require_oauth`; the user's token is passed through, or exchanged for a cluster token (RFC 8693 token exchange; the binary has `token_exchange` / `sts_*` options) | Audit shows the human; the agent can never do more than the user | The API server must trust the IdP; every user needs RBAC; harder to debug |
+| **Agent's own identity** (recommended for start) | SA / workload identity with fixed read-only RBAC (local stdio MCP server), or an IdP machine client whose token the remote MCP server passes through (**tried: [remote-mcp.md](remote-mcp.md)**) | Simple, predictable, same rights for everyone | Audit logs show the agent; you need the agent's own log to know which human asked |
+| **On behalf of the user** | Remote MCP server with `require_oauth`; the user's token is passed through, or exchanged for a cluster token (`[token_exchange]`: `rfc8693`, `keycloak-v1`, `entra-obo`) | Audit shows the human; the agent can never do more than the user | The API server must trust the IdP; every user needs RBAC; harder to debug |
 | Impersonation | Agent identity with `impersonate` on the user's groups | One credential, per-user rights | `impersonate` is a powerful verb; scope it with `resourceNames` |
 
 Whichever you pick: the agent's **read** and **write** identities stay separate (as in the lab), and the

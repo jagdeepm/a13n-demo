@@ -57,6 +57,19 @@ run = "lab/lab.sh reset"
 description = "Show deployments, pods, service endpoints, SLOs"
 run = "lab/lab.sh status"
 
+[tasks."lab:remote-up"]
+description = "Add Keycloak + an in-cluster MCP server over HTTP with OAuth; API server trusts Keycloak"
+run = "lab/lab.sh remote-up"
+
+[tasks."lab:remote-forward"]
+description = "Port-forward Keycloak (18080) and the remote MCP server (18081); keep it running"
+run = "lab/lab.sh remote-forward"
+raw = true
+
+[tasks."lab:remote-down"]
+description = "Remove Keycloak and the remote MCP server"
+run = "lab/lab.sh remote-down"
+
 [tasks."lab:down"]
 description = "Delete the kind cluster and generated lab files"
 run = "lab/lab.sh down"
@@ -72,6 +85,11 @@ description = "Chat with the agent against the kind cluster via MCP"
 run = "uv run sre_agent.py --k8s"
 raw = true
 
+[tasks."agent:remote"]
+description = "Same, but through the in-cluster MCP server over HTTP + OAuth (lab:remote-up, lab:remote-forward)"
+run = "set -a && . lab/remote.env && set +a && uv run sre_agent.py --k8s"
+raw = true
+
 # ---------------------------------------------------------------- CI checks
 [tasks.check]
 description = "CI checks: secrets, forbidden files, shell scripts, k8s manifests, Python, uv lock"
@@ -80,12 +98,12 @@ set -eu
 echo "== secrets (gitleaks, full git history)"
 gitleaks git --redact --no-banner ..
 echo "== forbidden files tracked by git"
-bad=$(git ls-files .. | grep -E '(^|/)(\.env|[^/]*\.env|[^/]*kubeconfig[^/]*|state[^/]*\.json|mcp\.(toml|log))$|(^|/)bin/' || true)
+bad=$(git ls-files .. | grep -E '(^|/)(\.env|[^/]*\.env|[^/]*kubeconfig[^/]*|state[^/]*\.json|mcp\.(toml|log)|[^/]*\.(key|pem))$|(^|/)(bin|remote-pki)/' || true)
 [ -z "$bad" ] || { echo "must not be committed:"; echo "$bad"; exit 1; }
 echo "== shell scripts (shellcheck)"
 shellcheck lab/lab.sh scripts/fetch-binaries.sh
 echo "== kubernetes manifests (kubeconform; SLO custom resources have no published schema)"
-kubeconform -strict -summary -ignore-missing-schemas lab/app.yaml lab/rbac.yaml
+kubeconform -strict -summary -ignore-missing-schemas lab/app.yaml lab/rbac.yaml lab/remote-mcp.yaml
 echo "== python (ruff: syntax errors, undefined names, unused imports)"
 uvx ruff@0.12.0 check ..
 echo "== pyproject.toml / uv.lock in sync"
@@ -101,6 +119,10 @@ run = "uv run test_offline.py"
 [tasks."test:k8s"]
 description = "Live wiring test against kind via MCP with a scripted model (no key)"
 run = "uv run test_k8s.py"
+
+[tasks."test:remote"]
+description = "Auth checks for the remote MCP server: 401 without/wrong token, passthrough identity, read-only"
+run = "set -a && . lab/remote.env && set +a && uv run test_remote_mcp.py"
 
 [tasks."test:e2e"]
 description = "Real-model E2E: inject failures, let the LLM fix them, grade by cluster state"

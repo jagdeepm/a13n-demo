@@ -1,0 +1,159 @@
+# Remote MCP server over HTTP with OAuth (lab.sh remote-up). See docs/remote-mcp.md.
+#   Keycloak (namespace keycloak)       OIDC provider, HTTPS on NodePort 30443; the agent logs in with client credentials
+#   kube-apiserver                      trusts Keycloak tokens (AuthenticationConfiguration written by lab.sh)
+#   kubernetes-mcp-server (sre-system)  HTTP mode, require_oauth, forwards the caller's token to the API server
+# lab.sh replaces __ISSUER__ (https://<node-ip>:30443/realms/sre) and creates the TLS/CA objects and client secrets.
+apiVersion: v1
+kind: Namespace
+metadata: {name: keycloak}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: realm, namespace: keycloak}
+data:
+  sre-realm.json: |
+    {
+      "realm": "sre",
+      "enabled": true,
+      "accessTokenLifespan": 900,
+      "clients": [
+        {
+          "clientId": "sre-agent",
+          "description": "The SRE agent: machine identity, client credentials only",
+          "publicClient": false,
+          "secret": "${SRE_AGENT_CLIENT_SECRET}",
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "protocolMappers": [{
+            "name": "audience-kubernetes-mcp-server",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {"included.custom.audience": "kubernetes-mcp-server", "access.token.claim": "true", "id.token.claim": "false"}
+          }]
+        },
+        {
+          "clientId": "other-app",
+          "description": "Valid login in the same realm, but its tokens are not for the MCP server (no audience)",
+          "publicClient": false,
+          "secret": "${OTHER_APP_CLIENT_SECRET}",
+          "serviceAccountsEnabled": true,
+          "standardFlowEnabled": false,
+          "directAccessGrantsEnabled": false
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: keycloak}}
+  template:
+    metadata: {labels: {app: keycloak}}
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:26.4.0
+        # ponytail: start-dev = in-memory DB, realm re-imported on every start. Production: `start` + a real DB, or your company IdP.
+        args: [start-dev, --import-realm, --health-enabled=true, --http-enabled=false,
+               --https-certificate-file=/etc/tls/tls.crt, --https-certificate-key-file=/etc/tls/tls.key,
+               # Fixed public URL, so the `iss` claim is the same whether a token is fetched via port-forward or NodePort
+               "--hostname=__ISSUER_BASE__"]
+        env:
+        - {name: KC_BOOTSTRAP_ADMIN_USERNAME, value: admin}
+        - {name: KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: clients, key: admin-password}}}
+        - {name: SRE_AGENT_CLIENT_SECRET, valueFrom: {secretKeyRef: {name: clients, key: sre-agent}}}
+        - {name: OTHER_APP_CLIENT_SECRET, valueFrom: {secretKeyRef: {name: clients, key: other-app}}}
+        ports: [{containerPort: 8443}, {containerPort: 9000, name: management}]
+        readinessProbe: {httpGet: {path: /health/ready, port: 9000, scheme: HTTPS}, periodSeconds: 5}
+        resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {memory: 1Gi}}
+        volumeMounts:
+        - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
+        - {name: tls, mountPath: /etc/tls, readOnly: true}
+      volumes:
+      - {name: realm, configMap: {name: realm}}
+      - {name: tls, secret: {secretName: tls}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  type: NodePort          # the API server runs on the host network and can't resolve *.svc names
+  selector: {app: keycloak}
+  ports: [{port: 8443, targetPort: 8443, nodePort: 30443}]
+---
+# The MCP server's own identity has NO RBAC: every cluster call must carry the caller's token.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kubernetes-mcp-server, namespace: sre-system}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: kubernetes-mcp-server, namespace: sre-system}
+data:
+  config.toml: |
+    port = "8080"
+    stateless = true                       # no change notifications; fine behind a load balancer
+    cluster_provider_strategy = "in-cluster"
+    cluster_auth_mode = "passthrough"      # call the API server with the caller's bearer token
+    read_only = true
+    toolsets = ["core"]
+    denied_resources = [{group = "", version = "v1", kind = "Secret"}]
+    # Who may call the server: a valid token from this issuer whose audience is this server.
+    require_oauth = true
+    authorization_url = "__ISSUER__"
+    oauth_audience = "kubernetes-mcp-server"
+    certificate_authority = "/etc/oidc-ca/ca.crt"
+    server_url = "http://localhost:18081"  # public URL clients use (here: the port-forward)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: kubernetes-mcp-server, namespace: sre-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: kubernetes-mcp-server}}
+  template:
+    metadata: {labels: {app: kubernetes-mcp-server}}
+    spec:
+      serviceAccountName: kubernetes-mcp-server
+      containers:
+      - name: server
+        image: quay.io/containers/kubernetes_mcp_server:v0.1.2
+        args: [--config, /etc/mcp/config.toml]
+        ports: [{containerPort: 8080}]
+        readinessProbe: {tcpSocket: {port: 8080}, periodSeconds: 5}
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
+        securityContext:
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+        volumeMounts:
+        - {name: config, mountPath: /etc/mcp, readOnly: true}
+        - {name: oidc-ca, mountPath: /etc/oidc-ca, readOnly: true}
+      volumes:
+      - {name: config, configMap: {name: kubernetes-mcp-server}}
+      - {name: oidc-ca, configMap: {name: oidc-ca}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kubernetes-mcp-server, namespace: sre-system}
+spec:
+  selector: {app: kubernetes-mcp-server}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+# Same read-only rights as the ServiceAccount in rbac.yaml, for the agent's Keycloak identity.
+# Username = "oidc:" + preferred_username (claimMappings in the API server's AuthenticationConfiguration).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: oidc-sre-agent-view}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view}
+subjects: [{apiGroup: rbac.authorization.k8s.io, kind: User, name: "oidc:service-account-sre-agent"}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: oidc-sre-agent-extra-read}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: sre-agent-extra-read}
+subjects: [{apiGroup: rbac.authorization.k8s.io, kind: User, name: "oidc:service-account-sre-agent"}]

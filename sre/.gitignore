@@ -13,6 +13,8 @@ state-k8s.json
 lab/readonly.kubeconfig
 lab/mcp.toml
 lab/mcp.log
+lab/remote.env
+lab/remote-pki/
 
 # Agent output inside the sandbox
 workspace/postmortems/
