@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sre
+    env:
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}/sre
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0            # gitleaks scans the whole history, not just the last commit
+      - uses: jdx/mise-action@v3
+        with:
+          working_directory: sre
+          install_args: uv gitleaks shellcheck kubeconform   # only what `check` needs
+      - run: mise run check

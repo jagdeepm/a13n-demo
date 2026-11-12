@@ -1,0 +1,107 @@
+# Local dev environment for the SRE agent demo. https://mise.jdx.dev
+#   mise trust && mise install && mise run setup
+# List tasks: mise tasks     Extra args are appended, e.g. `mise run lab:break oom`
+
+[tools]
+python = "3.13"
+uv = "0.13.7"
+kind = "0.32.0"
+kubectl = "1.36"
+gh = "2"              # downloads/verifies the two release binaries (scripts/fetch-binaries.sh)
+# CI checks (mise run check)
+gitleaks = "8.28.0"
+shellcheck = "0.11.0"
+kubeconform = "0.7.0"
+
+[env]
+# uv builds .venv with mise's Python (instead of whatever python is first on PATH)
+UV_PYTHON = "3.13"
+# Default model for the agent and E2E test; override per command with --model.
+OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+# Network for sandboxed shell commands: "deny" (default) or "inherit".
+SRE_EGRESS = "deny"
+# The API key is NOT set here: export OPENROUTER_API_KEY, or put OPENROUTER_API_KEY=... in ~/.openrouter.env.
+
+# ---------------------------------------------------------------- setup
+[tasks.setup]
+description = "Install Python deps and the a13n-envd + kubernetes-mcp-server binaries"
+run = ["uv sync", "scripts/fetch-binaries.sh"]
+
+[tasks.doctor]
+description = "Check tools, binaries, Docker and the API key are in place"
+run = '''
+set -u
+ok() { printf "  ok   %s\n" "$1"; }; bad() { printf "  MISSING %s\n" "$1"; }
+for t in python uv kind kubectl gh docker; do command -v $t >/dev/null && ok "$t" || bad "$t"; done
+docker info >/dev/null 2>&1 && ok "docker daemon running" || bad "docker daemon (start Docker Desktop)"
+[ -x bin/a13n-envd ] && ok "$(bin/a13n-envd --version)" || bad "bin/a13n-envd (mise run setup)"
+[ -x bin/kubernetes-mcp-server ] && ok "kubernetes-mcp-server $(bin/kubernetes-mcp-server --version)" || bad "bin/kubernetes-mcp-server (mise run setup)"
+{ [ -n "${OPENROUTER_API_KEY:-}" ] || grep -q '^OPENROUTER_API_KEY=' ~/.openrouter.env 2>/dev/null; } && ok "OpenRouter API key" || bad "OpenRouter API key (~/.openrouter.env)"
+kind get clusters 2>/dev/null | grep -qx sre-lab && ok "kind cluster sre-lab" || bad "kind cluster sre-lab (mise run lab:up)"
+'''
+
+# ---------------------------------------------------------------- kind lab
+[tasks."lab:up"]
+description = "Create kind cluster sre-lab, metrics-server, shop app, read-only identity, MCP config"
+run = "lab/lab.sh up"
+
+[tasks."lab:break"]
+description = "Inject a failure: crashloop | bad-image | oom | pending | no-endpoints | errors | unready"
+run = "lab/lab.sh break"
+
+[tasks."lab:reset"]
+description = "Restore the healthy baseline"
+run = "lab/lab.sh reset"
+
+[tasks."lab:status"]
+description = "Show deployments, pods, service endpoints, SLOs"
+run = "lab/lab.sh status"
+
+[tasks."lab:down"]
+description = "Delete the kind cluster and generated lab files"
+run = "lab/lab.sh down"
+
+# ---------------------------------------------------------------- agent
+[tasks.agent]
+description = "Chat with the agent against the simulated fleet (no cluster needed)"
+run = "uv run sre_agent.py"
+raw = true            # interactive: keep the terminal attached
+
+[tasks."agent:k8s"]
+description = "Chat with the agent against the kind cluster via MCP"
+run = "uv run sre_agent.py --k8s"
+raw = true
+
+# ---------------------------------------------------------------- CI checks
+[tasks.check]
+description = "CI checks: secrets, forbidden files, shell scripts, k8s manifests, Python, uv lock"
+run = '''
+set -eu
+echo "== secrets (gitleaks, full git history)"
+gitleaks git --redact --no-banner ..
+echo "== forbidden files tracked by git"
+bad=$(git ls-files .. | grep -E '(^|/)(\.env|[^/]*\.env|[^/]*kubeconfig[^/]*|state[^/]*\.json|mcp\.(toml|log))$|(^|/)bin/' || true)
+[ -z "$bad" ] || { echo "must not be committed:"; echo "$bad"; exit 1; }
+echo "== shell scripts (shellcheck)"
+shellcheck lab/lab.sh scripts/fetch-binaries.sh
+echo "== kubernetes manifests (kubeconform; SLO custom resources have no published schema)"
+kubeconform -strict -summary -ignore-missing-schemas lab/app.yaml lab/rbac.yaml
+echo "== python (ruff: syntax errors, undefined names, unused imports)"
+uvx ruff@0.12.0 check ..
+echo "== pyproject.toml / uv.lock in sync"
+uv lock --check
+echo "all checks passed"
+'''
+
+# ---------------------------------------------------------------- tests
+[tasks.test]
+description = "Offline test: scripted model, simulated fleet, sandbox escape checks (no key, no cluster)"
+run = "uv run test_offline.py"
+
+[tasks."test:k8s"]
+description = "Live wiring test against kind via MCP with a scripted model (no key)"
+run = "uv run test_k8s.py"
+
+[tasks."test:e2e"]
+description = "Real-model E2E: inject failures, let the LLM fix them, grade by cluster state"
+run = "uv run test_e2e_llm.py"

@@ -1,0 +1,157 @@
+# "shop" sample app. Healthy baseline; `lab.sh break <scenario>` mutates it, `lab.sh reset` re-applies this file.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+# CRD so the agent has a custom resource to discover and read (SLO targets + runbook hints).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: servicelevelobjectives.sre.demo.io
+spec:
+  group: sre.demo.io
+  scope: Namespaced
+  names: {kind: ServiceLevelObjective, plural: servicelevelobjectives, singular: servicelevelobjective, shortNames: [slo]}
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - {name: Service, type: string, jsonPath: .spec.service}
+        - {name: Availability, type: string, jsonPath: .spec.availabilityTarget}
+        - {name: Owner, type: string, jsonPath: .spec.owner}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [service, availabilityTarget]
+              properties:
+                service: {type: string}
+                availabilityTarget: {type: string}
+                latencyP99Ms: {type: integer}
+                owner: {type: string}
+                tier: {type: string}
+                notes: {type: string}
+---
+apiVersion: sre.demo.io/v1
+kind: ServiceLevelObjective
+metadata: {name: checkout-api, namespace: shop}
+spec:
+  service: checkout-api
+  availabilityTarget: "99.9%"
+  latencyP99Ms: 300
+  owner: checkout-team
+  tier: critical
+  notes: "Revenue path. Prefer rollback over forward-fix. Must keep >=2 ready replicas."
+---
+apiVersion: sre.demo.io/v1
+kind: ServiceLevelObjective
+metadata: {name: payments-worker, namespace: shop}
+spec:
+  service: payments-worker
+  availabilityTarget: "99.5%"
+  owner: payments-team
+  tier: high
+  notes: "Async worker. Memory-heavy batches; limits were sized for 64Mi."
+---
+apiVersion: sre.demo.io/v1
+kind: ServiceLevelObjective
+metadata: {name: frontend, namespace: shop}
+spec:
+  service: frontend
+  availabilityTarget: "99.5%"
+  owner: web-team
+  tier: high
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: checkout-api, namespace: shop, labels: {app: checkout-api}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: checkout-api}}
+  template:
+    metadata: {labels: {app: checkout-api}}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          command: [./podinfo]
+          args: [--port=9898, --level=info]
+          ports: [{containerPort: 9898}]
+          readinessProbe: {httpGet: {path: /readyz, port: 9898}, periodSeconds: 3}
+          livenessProbe: {httpGet: {path: /healthz, port: 9898}, periodSeconds: 5}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: checkout-api, namespace: shop}
+spec:
+  selector: {app: checkout-api}
+  ports: [{port: 9898, targetPort: 9898}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: payments-worker, namespace: shop, labels: {app: payments-worker}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: payments-worker}}
+  template:
+    metadata: {labels: {app: payments-worker}}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          command: [./podinfo]
+          args: [--port=9898]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: frontend, namespace: shop, labels: {app: frontend}}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: frontend}}
+  template:
+    metadata: {labels: {app: frontend}}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          command: [./podinfo]
+          args: [--port=9898, --backend-url=http://checkout-api:9898/echo]
+          readinessProbe: {httpGet: {path: /readyz, port: 9898}, periodSeconds: 3}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+---
+# Synthetic traffic: its logs are the "customer view" (status code + latency for every request).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loadgen, namespace: shop, labels: {app: loadgen}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: loadgen}}
+  template:
+    metadata: {labels: {app: loadgen}}
+    spec:
+      containers:
+        - name: curl
+          image: curlimages/curl:8.17.0
+          command: [sh, -c]
+          args:
+            - |
+              while true; do
+                r=$(curl -s -o /dev/null -m 3 -w '%{http_code} %{time_total}s' http://checkout-api:9898/api/info) || true  # failures print 000
+                echo "$(date -u +%H:%M:%S) checkout-api GET /api/info -> $r"
+                sleep 1
+              done
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {memory: 32Mi}
